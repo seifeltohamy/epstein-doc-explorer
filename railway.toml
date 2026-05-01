@@ -4,6 +4,6 @@ buildCommand = "npm install && cd network-ui && npm install && npm run build && 
 
 [deploy]
 startCommand = "npx tsx api_server.ts"
-healthcheckPath = "/api/stats"
+healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"

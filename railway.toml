@@ -3,7 +3,7 @@ builder = "NIXPACKS"
 buildCommand = "npm install && cd network-ui && npm install && npm run build && cd .."
 
 [deploy]
-startCommand = "npx tsx api_server.ts"
+startCommand = "bash start.sh"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"

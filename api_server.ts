@@ -31,6 +31,11 @@ app.use(cors({
       return callback(null, true);
     }
 
+    // Allow Railway deployment domains
+    if (origin && (origin.includes('.railway.app') || origin.endsWith('.railway.app'))) {
+      return callback(null, true);
+    }
+
     // Log rejected origins for debugging
     console.warn(`CORS blocked origin: ${origin}`);
 

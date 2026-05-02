@@ -74,7 +74,7 @@ const LandingPage: React.FC<LandingPageProps> = ({ onPersonClick, onExplorerClic
 
       {/* Hero */}
       <div className="flex flex-col items-center text-center mb-10">
-        <img src="/logo.png" alt="Epstein Graph" className="w-24 h-24 mb-5 opacity-90" />
+        <img src="/logo.webp" alt="Epstein Graph" className="w-24 h-24 mb-5 opacity-90" />
         <h1 className="text-5xl font-bold tracking-widest mb-3" style={{ color: '#5eead4', letterSpacing: '0.15em' }}>
           EPSTEIN GRAPH
         </h1>

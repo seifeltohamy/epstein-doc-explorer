@@ -69,7 +69,7 @@ const LandingPage: React.FC<LandingPageProps> = ({ onPersonClick, onExplorerClic
     : null;
 
   return (
-    <div className="min-h-full flex flex-col items-center justify-start pt-16 pb-16 px-4"
+    <div className="w-full min-h-full flex flex-col items-center justify-start pt-16 pb-16 px-4"
          style={{ background: '#0a0e1a' }}>
 
       {/* Hero */}

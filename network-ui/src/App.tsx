@@ -185,7 +185,7 @@ function App() {
 
       {/* Landing Page */}
       {activeView === 'landing' && (
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 w-full overflow-y-auto">
           <LandingPage
             onPersonClick={goToPerson}
             onExplorerClick={() => goToExplorerWithKeyword('')}

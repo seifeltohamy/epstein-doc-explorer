@@ -14,6 +14,59 @@ interface PersonProfileProps {
 
 interface TimelinePoint { year: number; value: number; }
 
+const NODE_BIOS: Record<string, string> = {
+  "Jeffrey Epstein": "American financier and convicted sex offender. At the center of an international trafficking network involving dozens of wealthy and powerful figures. Arrested in July 2019 and died in federal custody in August 2019.",
+  "Donald Trump": "American businessman and 45th/47th U.S. President. Knew Epstein socially for years in New York and Palm Beach circles. Mentioned in flight logs and witness depositions.",
+  "Ehud Barak": "Former Israeli Prime Minister and Defense Minister. Invested in Epstein-linked tech ventures and visited Epstein's properties multiple times after his 2008 conviction.",
+  "Edward Snowden": "NSA whistleblower and former intelligence contractor who leaked classified surveillance documents in 2013. Appears in the Epstein corpus in the context of surveillance and intelligence discussions.",
+  "Alan M. Dershowitz": "Harvard Law professor and high-profile defense attorney who represented Epstein during the 2008 plea deal negotiations. Subject of abuse allegations by Virginia Roberts Giuffre, which he has denied.",
+  "Steve Bannon": "Political strategist and former White House Chief Strategist to Donald Trump. Referenced in Epstein documents in the context of political networks and influence.",
+  "Bill Clinton": "42nd U.S. President. Flew on Epstein's private jet multiple times according to flight logs. Clinton denies visiting Epstein's private island.",
+  "Jeffrey E.": "Abbreviated reference to Jeffrey Epstein appearing across multiple documents and correspondence.",
+  "Ghislaine Maxwell": "British socialite and Epstein's longtime associate and alleged co-conspirator. Convicted in 2021 on federal sex trafficking charges and sentenced to 20 years in prison.",
+  "Kathy Ruemmler": "Former White House Counsel under President Obama. Represented Epstein in post-conviction legal matters and attended meetings on his behalf.",
+  "Michael Wolff": "Journalist and author known for 'Fire and Fury.' Mentioned in Epstein's contact network and correspondence files.",
+  "Virginia Roberts Giuffre": "Epstein trafficking survivor and activist. Filed civil suits alleging she was trafficked to powerful figures including Prince Andrew and Alan Dershowitz. Her legal filings are central to the public record.",
+  "Reid Weingarten": "High-profile Washington defense attorney who represented Epstein during federal investigations.",
+  "Lawrence M. Krauss": "Theoretical physicist and science communicator. Received funding from Epstein and maintained a relationship with him after his 2008 conviction, drawing significant criticism.",
+  "Paul Krassner": "American satirist, journalist, and counterculture figure. Appears in Epstein's correspondence and social network.",
+  "Landon Thomas Jr.": "New York Times financial journalist who wrote extensively about Epstein, including early profiles before the full scope of his crimes was known.",
+  "Barack Obama": "44th U.S. President. Referenced in Epstein documents primarily in the context of political figures connected to Epstein's social network and fundraising circles.",
+  "United States": "The U.S. federal government as a party in criminal and civil proceedings against Epstein and associates, including the Department of Justice prosecution.",
+  "court": "References to court proceedings, judicial filings, and legal proceedings across the Epstein civil and criminal cases.",
+  "Lawrence Summers": "Former U.S. Treasury Secretary and Harvard president. Received a donation from Epstein to Harvard and was connected through academic and financial networks.",
+  "Palm Beach Police Department": "Local law enforcement agency that first investigated Epstein for sexual abuse of minors in 2005, leading to the controversial 2008 non-prosecution agreement.",
+  "Bank of America Merrill Lynch": "Financial institution referenced in Epstein financial records and asset management documents.",
+  "the author": "Narrative reference to a first-person narrator in documents and memoirs within the Epstein corpus.",
+  "Bradley James Edwards": "Florida attorney who represented multiple Epstein victims in civil suits and was a key figure in challenging the secret non-prosecution agreement.",
+  "Prince Andrew, Duke of York": "British royal and son of Queen Elizabeth II. Accused by Virginia Roberts Giuffre of sexual abuse. Reached a civil settlement with Giuffre in 2022 and was stripped of royal patronages and military titles.",
+  "narrator": "First-person narrative voice appearing in documents and testimonies within the corpus.",
+  "Robert Lawrence Kuhn": "American businessman, author, and China expert. Appears in Epstein's intellectual and social network correspondence.",
+  "FBI": "The U.S. Federal Bureau of Investigation, which investigated Epstein in multiple jurisdictions and was involved in his 2019 arrest.",
+  "Iran": "Referenced in the Epstein corpus in the context of geopolitical discussions and intelligence-related documents.",
+  "Richard Kahn": "Associate referenced in Epstein financial and operational documents.",
+  "Peggy Siegal": "New York film publicist and socialite who organized events where Epstein met high-profile individuals, including a dinner held for Epstein shortly after his 2008 release from prison.",
+  "Israel": "Referenced throughout the corpus in the context of Epstein's relationships with Israeli political figures, intelligence discussions, and financial dealings.",
+  "communication": "Generic reference to communications and correspondence appearing across documents in the corpus.",
+  "Boris Nikolic": "Biotech entrepreneur and former science advisor to Bill Gates. Named as an alternate executor in Epstein's will, which was filed the day before his death.",
+  "Hillary Rodham Clinton": "Former U.S. Secretary of State and 2016 presidential candidate. Referenced in Epstein documents through political network connections.",
+  "Benjamin Netanyahu": "Israeli Prime Minister. Connected through Epstein's relationships with Israeli political leadership, particularly via Ehud Barak.",
+  "Mr. Leopold": "Individual referenced in Epstein legal and correspondence documents.",
+  "research report": "References to academic and financial research reports circulated within Epstein's network.",
+  "Federal prosecutors": "U.S. federal prosecution teams handling Epstein criminal cases, primarily in the Southern District of New York.",
+  "Nicholas Ribis": "American businessman and casino executive. Appears in Epstein's financial and social network documents.",
+  "jeevacation@gmail.com": "Email address appearing in Epstein communications and contact records.",
+  "Darren K. Indyke": "New York attorney who served as one of Epstein's primary lawyers and was a co-executor of his estate.",
+  "Yitzhak Rabin": "Former Israeli Prime Minister and Nobel Peace Prize laureate. Referenced in Epstein's historical and political network documents.",
+  "Martin G. Weinberg": "Boston-based defense attorney who represented Epstein during federal legal proceedings.",
+  "Jared Kushner": "Real estate developer and son-in-law of Donald Trump. Referenced in Epstein documents through overlapping New York social and financial networks.",
+  "Glenn Greenwald": "Journalist and co-founder of The Intercept. Referenced in Epstein documents in the context of surveillance and intelligence journalism.",
+  "Mr. Tein": "Individual referenced in Epstein legal proceedings and correspondence.",
+  "Elisa New": "Harvard professor and poet. Appears in correspondence related to Epstein's Harvard connections and academic network.",
+  "Melanie Spinella": "Individual appearing in Epstein operational and correspondence documents.",
+  "China": "Referenced in the Epstein corpus in the context of international business dealings and geopolitical discussions.",
+};
+
 const AreaChart: React.FC<{ data: TimelinePoint[]; label: string }> = ({ data, label }) => {
   const svgRef = useRef<SVGSVGElement>(null);
 
@@ -188,10 +241,9 @@ const PersonProfile: React.FC<PersonProfileProps> = ({ nodeId, onBack, onPersonC
         </span>
       </div>
 
-      {/* Bio placeholder */}
+      {/* Bio */}
       <p className="text-slate-400 text-sm mb-8 leading-relaxed">
-        Known associate in the Epstein connection network, identified through document analysis of
-        court records, emails, and flight logs.
+        {NODE_BIOS[node.name] ?? `Appears in ${node.document_mentions.toLocaleString()} documents in the Epstein corpus.`}
       </p>
 
       {/* Top Connections */}

@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import dns from 'dns';
+dns.setDefaultResultOrder('ipv4first'); // Railway doesn't support IPv6
+
 import express from 'express';
 import cors from 'cors';
 import { Pool } from 'pg';
@@ -45,8 +48,7 @@ app.use((req, res, next) => {
 });
 
 if (!DATABASE_URL) {
-  console.error('DATABASE_URL is not set');
-  process.exit(1);
+  console.error('DATABASE_URL is not set — DB queries will fail');
 }
 
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
@@ -54,8 +56,7 @@ const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorize
 pool.query('SELECT 1').then(() => {
   console.log('✓ Database connected');
 }).catch(err => {
-  console.error('Failed to connect to database:', err);
-  process.exit(1);
+  console.error('Failed to connect to database:', err.message);
 });
 
 let tagClusters: any[] = [];

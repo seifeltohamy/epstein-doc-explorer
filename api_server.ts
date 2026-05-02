@@ -1,129 +1,103 @@
 #!/usr/bin/env node
 
-import dns from 'dns';
-dns.setDefaultResultOrder('ipv4first'); // Railway doesn't support IPv6
-
 import express from 'express';
 import cors from 'cors';
-import { Pool } from 'pg';
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const DATABASE_URL = process.env.DATABASE_URL;
+const DB_PATH = process.env.DB_PATH || '/tmp/document_analysis.db';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS && process.env.ALLOWED_ORIGINS.trim())
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000', 'https://epsteinvisualizer.com', 'https://www.epsteinvisualizer.com'];
 
 console.log('Allowed CORS origins:', ALLOWED_ORIGINS);
 
+// CORS configuration with origin whitelist
 app.use(cors({
   origin: (origin, callback) => {
+    // Allow requests with no origin (same-origin requests, mobile apps, curl)
     if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    if (origin.includes('.onrender.com') || origin.includes('.railway.app')) return callback(null, true);
+
+    // Allow localhost origins for development
+    if (ALLOWED_ORIGINS.includes(origin)) {
+      return callback(null, true);
+    }
+
+    // Allow Render deployment domains (*.onrender.com)
+    if (origin && (origin.includes('.onrender.com') || origin.endsWith('onrender.com'))) {
+      return callback(null, true);
+    }
+
+    // Allow Railway deployment domains
+    if (origin && (origin.includes('.railway.app') || origin.endsWith('.railway.app'))) {
+      return callback(null, true);
+    }
+
+    // Log rejected origins for debugging
     console.warn(`CORS blocked origin: ${origin}`);
+
+    // Reject other origins
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
   maxAge: 86400
 }));
 
+// Request size limits
 app.use(express.json({ limit: '10mb' }));
 
-// Rate limiting
+// Simple rate limiting middleware
 const requestCounts = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX_REQUESTS = 1000; // Max requests per window
+
 app.use((req, res, next) => {
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   const userData = requestCounts.get(ip);
+
   if (!userData || now > userData.resetTime) {
-    requestCounts.set(ip, { count: 1, resetTime: now + 15 * 60 * 1000 });
+    requestCounts.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return next();
   }
-  if (userData.count >= 1000) return res.status(429).json({ error: 'Too many requests' });
+
+  if (userData.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return res.status(429).json({ error: 'Too many requests, please try again later' });
+  }
+
   userData.count++;
   next();
 });
 
-if (!DATABASE_URL) {
-  console.error('DATABASE_URL is not set — DB queries will fail');
+// Initialize database with error handling
+let db: Database.Database;
+try {
+  db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL'); // Enable WAL mode for better concurrency
+  console.log(`✓ Database initialized: ${DB_PATH}`);
+} catch (error) {
+  console.error('Failed to initialize database:', error);
+  process.exit(1);
 }
 
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
-
-pool.query('SELECT 1').then(() => {
-  console.log('✓ Database connected');
-}).catch(err => {
-  console.error('Failed to connect to database:', err.message);
-});
-
+// Load tag clusters with error handling
 let tagClusters: any[] = [];
 try {
-  tagClusters = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'tag_clusters.json'), 'utf-8'));
+  const clustersPath = path.join(process.cwd(), 'tag_clusters.json');
+  tagClusters = JSON.parse(fs.readFileSync(clustersPath, 'utf-8'));
   console.log(`✓ Loaded ${tagClusters.length} tag clusters`);
-} catch {
+} catch (error) {
+  console.error('Failed to load tag clusters:', error);
   tagClusters = [];
 }
 
-function validateLimit(limit: any): number {
-  const parsed = parseInt(limit);
-  if (isNaN(parsed) || parsed < 1) return 500;
-  return Math.min(20000, Math.max(1, parsed));
-}
-
-function validateClusterIds(clusters: any): number[] {
-  if (!clusters) return [];
-  return String(clusters).split(',').map(Number).filter(n => !isNaN(n) && n >= 0 && Number.isInteger(n)).slice(0, 50);
-}
-
-function validateCategories(categories: any): string[] {
-  if (!categories) return [];
-  return String(categories).split(',').map(c => c.trim()).filter(c => c.length > 0 && c.length < 100).slice(0, 50);
-}
-
-function validateYearRange(yearMin: any, yearMax: any): [number, number] | null {
-  if (!yearMin && !yearMax) return null;
-  const min = parseInt(yearMin), max = parseInt(yearMax);
-  if (isNaN(min) || isNaN(max) || min < 1970 || max > 2025 || min > max) return null;
-  return [min, max];
-}
-
-function validateKeywords(keywords: any): string[] {
-  if (!keywords) return [];
-  return String(keywords).split(',').map(k => k.trim().toLowerCase()).filter(k => k.length > 0 && k.length < 100).slice(0, 20);
-}
-
-function validateMaxHops(maxHops: any): number | null {
-  if (!maxHops || maxHops === 'any') return null;
-  const parsed = parseInt(maxHops);
-  if (isNaN(parsed) || parsed < 1 || parsed > 10) return null;
-  return parsed;
-}
-
-function calculateBM25Score(text: string, keywords: string[]): number {
-  if (!text || keywords.length === 0) return 0;
-  const words = text.toLowerCase().split(/\s+/);
-  const k1 = 1.2, b = 0.75, avgDocLength = 100;
-  let score = 0;
-  keywords.forEach(keyword => {
-    const tf = words.filter(w => w.includes(keyword)).length;
-    if (tf === 0) return;
-    const idf = Math.log(10);
-    score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (words.length / avgDocLength)));
-  });
-  return score;
-}
-
-// Build a parameterized $N placeholder string starting at offset
-function placeholders(count: number, offset = 0): string {
-  return Array.from({ length: count }, (_, i) => `$${i + offset + 1}`).join(', ');
-}
-
-app.get('/api/actors', async (req, res) => {
+// Get all actors (nodes) with alias resolution
+app.get('/api/actors', (req, res) => {
   try {
-    const { rows } = await pool.query(`
+    const actors = db.prepare(`
       SELECT DISTINCT
         COALESCE(ea.canonical_name, rt.actor) as name,
         COUNT(*) as connection_count
@@ -132,90 +106,219 @@ app.get('/api/actors', async (req, res) => {
       GROUP BY COALESCE(ea.canonical_name, rt.actor)
       ORDER BY connection_count DESC
       LIMIT 100
-    `);
-    res.json(rows);
+    `).all();
+    res.json(actors);
   } catch (error) {
     console.error('Error in /api/actors:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
-app.get('/api/relationships', async (req, res) => {
+// Helper function to validate and sanitize inputs
+function validateLimit(limit: any): number {
+  const parsed = parseInt(limit);
+  if (isNaN(parsed) || parsed < 1) return 500;
+  return Math.min(20000, Math.max(1, parsed));
+}
+
+function validateClusterIds(clusters: any): number[] {
+  if (!clusters) return [];
+  return String(clusters)
+    .split(',')
+    .map(Number)
+    .filter(n => !isNaN(n) && n >= 0 && Number.isInteger(n))
+    .slice(0, 50); // Limit to 50 clusters max
+}
+
+function validateCategories(categories: any): string[] {
+  if (!categories) return [];
+  return String(categories)
+    .split(',')
+    .map(c => c.trim())
+    .filter(c => c.length > 0 && c.length < 100) // Reasonable category name length
+    .slice(0, 50); // Limit to 50 categories max
+}
+
+function validateYearRange(yearMin: any, yearMax: any): [number, number] | null {
+  if (!yearMin && !yearMax) return null; // No year filter
+
+  const min = parseInt(yearMin);
+  const max = parseInt(yearMax);
+
+  if (isNaN(min) || isNaN(max)) return null;
+  if (min < 1970 || max > 2025 || min > max) return null;
+
+  return [min, max];
+}
+
+function validateKeywords(keywords: any): string[] {
+  if (!keywords) return [];
+  return String(keywords)
+    .split(',')
+    .map(k => k.trim().toLowerCase())
+    .filter(k => k.length > 0 && k.length < 100) // Reasonable keyword length
+    .slice(0, 20); // Limit to 20 keywords max
+}
+
+function validateMaxHops(maxHops: any): number | null {
+  if (!maxHops) return null; // No hop filter
+  if (maxHops === 'any') return null; // "any" means no limit
+  const parsed = parseInt(maxHops);
+  if (isNaN(parsed) || parsed < 1 || parsed > 10) return null;
+  return parsed;
+}
+
+// BM25 scoring function for fuzzy text matching
+function calculateBM25Score(text: string, keywords: string[]): number {
+  if (!text || keywords.length === 0) return 0;
+
+  const textLower = text.toLowerCase();
+  const words = textLower.split(/\s+/);
+  const docLength = words.length;
+  const avgDocLength = 100; // Approximate average document length
+
+  // BM25 parameters
+  const k1 = 1.2; // Term frequency saturation parameter
+  const b = 0.75; // Length normalization parameter
+
+  let score = 0;
+
+  keywords.forEach(keyword => {
+    // Count term frequency in document
+    const tf = words.filter(word => word.includes(keyword)).length;
+    if (tf === 0) return;
+
+    // Simplified IDF (inverse document frequency) - assume keyword appears in 10% of docs
+    const idf = Math.log(10);
+
+    // BM25 formula
+    const numerator = tf * (k1 + 1);
+    const denominator = tf + k1 * (1 - b + b * (docLength / avgDocLength));
+
+    score += idf * (numerator / denominator);
+  });
+
+  return score;
+}
+
+// No longer needed - we use the materialized top_cluster_ids column instead
+
+// Get all relationships (edges) with distance-based pruning
+app.get('/api/relationships', (req, res) => {
   try {
     const limit = validateLimit(req.query.limit);
     const clusterIds = validateClusterIds(req.query.clusters);
     const categories = validateCategories(req.query.categories);
     const yearRange = validateYearRange(req.query.yearMin, req.query.yearMax);
-    const includeUndated = req.query.includeUndated !== 'false';
+    const includeUndated = req.query.includeUndated !== 'false'; // Default to true
     const keywords = validateKeywords(req.query.keywords);
     const maxHops = validateMaxHops(req.query.maxHops);
     const EPSTEIN_NAME = 'Jeffrey Epstein';
+
+    // Build set of selected cluster IDs for filtering
     const selectedClusterIds = new Set<number>(clusterIds);
     const selectedCategories = new Set<string>(categories);
 
-    const params: any[] = [];
-    let whereClauses = [`(rt.timestamp IS NULL OR rt.timestamp >= '1970-01-01')`];
-
+    // Build WHERE clause for categories
+    let categoryWhere = '';
+    let categoryParams: string[] = [];
     if (selectedCategories.size > 0) {
-      params.push(Array.from(selectedCategories));
-      whereClauses.push(`d.category = ANY($${params.length}::text[])`);
+      const placeholders = Array.from(selectedCategories).map(() => '?').join(',');
+      categoryWhere = `AND d.category IN (${placeholders})`;
+      categoryParams = Array.from(selectedCategories);
     }
 
+    // Build WHERE clause for year range
+    let yearWhere = '';
+    let yearParams: string[] = [];
     if (yearRange) {
       const [minYear, maxYear] = yearRange;
       if (includeUndated) {
-        params.push(minYear, maxYear);
-        whereClauses.push(`(rt.timestamp IS NULL OR (LEFT(rt.timestamp,4)::int >= $${params.length-1} AND LEFT(rt.timestamp,4)::int <= $${params.length}))`);
+        yearWhere = `AND (rt.timestamp IS NULL OR (CAST(substr(rt.timestamp, 1, 4) AS INTEGER) >= ? AND CAST(substr(rt.timestamp, 1, 4) AS INTEGER) <= ?))`;
       } else {
-        params.push(minYear, maxYear);
-        whereClauses.push(`(rt.timestamp IS NOT NULL AND LEFT(rt.timestamp,4)::int >= $${params.length-1} AND LEFT(rt.timestamp,4)::int <= $${params.length})`);
+        yearWhere = `AND (rt.timestamp IS NOT NULL AND CAST(substr(rt.timestamp, 1, 4) AS INTEGER) >= ? AND CAST(substr(rt.timestamp, 1, 4) AS INTEGER) <= ?)`;
       }
+      yearParams = [minYear.toString(), maxYear.toString()];
     }
 
+    // Build WHERE clause for hop distance using canonical_entities table
     let hopJoins = '';
+    let hopWhere = '';
+    let hopParams: number[] = [];
     if (maxHops !== null) {
-      params.push(maxHops, maxHops);
       hopJoins = `
-        LEFT JOIN canonical_entities ce_actor ON COALESCE(ea_actor.canonical_name, rt.actor) = ce_actor.canonical_name
-        LEFT JOIN canonical_entities ce_target ON COALESCE(ea_target.canonical_name, rt.target) = ce_target.canonical_name`;
-      whereClauses.push(`ce_actor.hop_distance_from_principal <= $${params.length-1} AND ce_target.hop_distance_from_principal <= $${params.length}`);
+      LEFT JOIN canonical_entities ce_actor ON COALESCE(ea_actor.canonical_name, rt.actor) = ce_actor.canonical_name
+      LEFT JOIN canonical_entities ce_target ON COALESCE(ea_target.canonical_name, rt.target) = ce_target.canonical_name`;
+      hopWhere = `AND ce_actor.hop_distance_from_principal <= ?
+                  AND ce_target.hop_distance_from_principal <= ?`;
+      hopParams = [maxHops, maxHops];
     }
 
-    params.push(100000);
-    const sql = `
-      SELECT rt.id, rt.doc_id, rt.timestamp,
+    // Fetch relationships with alias resolution and triple_tags
+    // Apply database-level LIMIT to prevent memory exhaustion
+    const MAX_DB_LIMIT = 100000; // Maximum rows to fetch from database
+    const allRelationships = db.prepare(`
+      SELECT
+        rt.id,
+        rt.doc_id,
+        rt.timestamp,
         COALESCE(ea_actor.canonical_name, rt.actor) as actor,
         rt.action,
         COALESCE(ea_target.canonical_name, rt.target) as target,
-        rt.location, rt.triple_tags, rt.top_cluster_ids
+        rt.location,
+        rt.triple_tags,
+        rt.top_cluster_ids
       FROM rdf_triples rt
       LEFT JOIN entity_aliases ea_actor ON rt.actor = ea_actor.original_name
       LEFT JOIN entity_aliases ea_target ON rt.target = ea_target.original_name
       ${hopJoins}
       LEFT JOIN documents d ON rt.doc_id = d.doc_id
-      WHERE ${whereClauses.join(' AND ')}
+      WHERE (rt.timestamp IS NULL OR rt.timestamp >= '1970-01-01')
+      ${categoryWhere}
+      ${yearWhere}
+      ${hopWhere}
       ORDER BY rt.timestamp
-      LIMIT $${params.length}
-    `;
+      LIMIT ?
+    `).all(...categoryParams, ...yearParams, ...hopParams, MAX_DB_LIMIT) as Array<{
+      id: number;
+      doc_id: string;
+      timestamp: string | null;
+      actor: string;
+      action: string;
+      target: string;
+      location: string | null;
+      triple_tags: string | null;
+      top_cluster_ids: string | null;
+    }>;
 
-    const { rows: allRelationships } = await pool.query(sql, params);
-
+    // Filter by tag clusters if specified
     let filteredRelationships = allRelationships.filter(rel => {
-      if (selectedClusterIds.size === 0) return true;
+      if (selectedClusterIds.size === 0) return true; // No filter
+
       try {
+        // Use the materialized top_cluster_ids column
         const topClusters = rel.top_cluster_ids ? JSON.parse(rel.top_cluster_ids) : [];
-        return topClusters.some((id: number) => selectedClusterIds.has(id));
-      } catch { return false; }
+        // Include if any of the top 3 clusters are selected
+        return topClusters.some((clusterId: number) => selectedClusterIds.has(clusterId));
+      } catch {
+        return false;
+      }
     });
 
+    // Filter by keywords using BM25 fuzzy matching if specified
     if (keywords.length > 0) {
       filteredRelationships = filteredRelationships.filter(rel => {
-        const score = calculateBM25Score(`${rel.actor} ${rel.action} ${rel.target} ${rel.location || ''}`, keywords);
+        // Build searchable text from relationship fields
+        const searchText = `${rel.actor} ${rel.action} ${rel.target} ${rel.location || ''}`;
+        const score = calculateBM25Score(searchText, keywords);
+        // Include relationships with non-zero BM25 score (at least one keyword match)
         return score > 0;
       });
     }
 
+    // Build adjacency list for BFS
     const adjacency = new Map<string, Set<string>>();
+
     filteredRelationships.forEach(rel => {
       if (!adjacency.has(rel.actor)) adjacency.set(rel.actor, new Set());
       if (!adjacency.has(rel.target)) adjacency.set(rel.target, new Set());
@@ -223,195 +326,309 @@ app.get('/api/relationships', async (req, res) => {
       adjacency.get(rel.target)!.add(rel.actor);
     });
 
+    // BFS to calculate distances from Jeffrey Epstein
     const distances = new Map<string, number>();
+    const queue: string[] = [];
+
     if (adjacency.has(EPSTEIN_NAME)) {
       distances.set(EPSTEIN_NAME, 0);
-      const queue = [EPSTEIN_NAME];
+      queue.push(EPSTEIN_NAME);
+
       while (queue.length > 0) {
         const current = queue.shift()!;
-        const d = distances.get(current)!;
-        adjacency.get(current)!.forEach(neighbor => {
-          if (!distances.has(neighbor)) { distances.set(neighbor, d + 1); queue.push(neighbor); }
+        const currentDistance = distances.get(current)!;
+
+        const neighbors = adjacency.get(current) || new Set();
+        neighbors.forEach(neighbor => {
+          if (!distances.has(neighbor)) {
+            distances.set(neighbor, currentDistance + 1);
+            queue.push(neighbor);
+          }
         });
       }
     }
 
+    // First, deduplicate edges by grouping relationships between same actor pairs
     const edgeMap = new Map<string, any[]>();
+
     filteredRelationships.forEach(rel => {
-      const key = `${rel.actor}|||${rel.target}`;
-      if (!edgeMap.has(key)) edgeMap.set(key, []);
-      edgeMap.get(key)!.push(rel);
+      const edgeKey = `${rel.actor}|||${rel.target}`;
+      if (!edgeMap.has(edgeKey)) {
+        edgeMap.set(edgeKey, []);
+      }
+      edgeMap.get(edgeKey)!.push(rel);
     });
 
-    const uniqueEdges = Array.from(edgeMap.entries()).map(([key, rels]) => ({ key, relationships: rels, representative: rels[0] }));
-    const nodeDegrees = new Map<string, number>();
-    uniqueEdges.forEach(e => {
-      nodeDegrees.set(e.representative.actor, (nodeDegrees.get(e.representative.actor) || 0) + 1);
-      nodeDegrees.set(e.representative.target, (nodeDegrees.get(e.representative.target) || 0) + 1);
-    });
-
-    const prunedEdges = uniqueEdges
-      .map(e => ({ ...e, _density: (nodeDegrees.get(e.representative.actor) || 0) + (nodeDegrees.get(e.representative.target) || 0) }))
-      .sort((a, b) => b._density - a._density)
-      .slice(0, limit);
-
-    const relationships = prunedEdges.flatMap(e => e.relationships).map(({ triple_tags, ...rel }) => ({
-      ...rel, tags: triple_tags ? JSON.parse(triple_tags) : []
+    // Convert to array of unique edges (each edge represents all relationships between that pair)
+    const uniqueEdges = Array.from(edgeMap.entries()).map(([key, rels]) => ({
+      edgeKey: key,
+      relationships: rels,
+      // Use first relationship as representative
+      representative: rels[0]
     }));
 
-    res.json({ relationships, totalBeforeLimit: uniqueEdges.length, totalBeforeFilter: allRelationships.length });
+    // Calculate node degrees based on UNIQUE edges
+    const nodeDegrees = new Map<string, number>();
+    uniqueEdges.forEach(edge => {
+      const rel = edge.representative;
+      nodeDegrees.set(rel.actor, (nodeDegrees.get(rel.actor) || 0) + 1);
+      nodeDegrees.set(rel.target, (nodeDegrees.get(rel.target) || 0) + 1);
+    });
+
+    // Assign density score to each unique edge
+    const edgesWithDensity = uniqueEdges.map(edge => {
+      const rel = edge.representative;
+      const actorDegree = nodeDegrees.get(rel.actor) || 0;
+      const targetDegree = nodeDegrees.get(rel.target) || 0;
+      const densityScore = actorDegree + targetDegree;
+
+      return {
+        ...edge,
+        _density: densityScore
+      };
+    });
+
+    // Sort unique edges by density (highest first) and take top limit
+    edgesWithDensity.sort((a, b) => b._density - a._density);
+    const prunedEdges = edgesWithDensity.slice(0, limit);
+
+    // Expand back to all relationships for the kept edges
+    const prunedRelationships = prunedEdges.flatMap(edge => edge.relationships);
+
+    // Parse tags before sending
+    const relationships = prunedRelationships.map(({ triple_tags, ...rel }) => ({
+      ...rel,
+      tags: triple_tags ? JSON.parse(triple_tags) : []
+    }));
+
+    // Return both the relationships and metadata
+    res.json({
+      relationships,
+      totalBeforeLimit: uniqueEdges.length, // Count of unique edges, not total triples
+      totalBeforeFilter: allRelationships.length
+    });
   } catch (error) {
     console.error('Error in /api/relationships:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
-app.get('/api/actor/:name/relationships', async (req, res) => {
+// Get relationships for specific actor with alias resolution and cluster filtering
+app.get('/api/actor/:name/relationships', (req, res) => {
   try {
     const { name } = req.params;
-    if (!name || name.length > 200) return res.status(400).json({ error: 'Invalid actor name' });
+
+    // Validate actor name
+    if (!name || name.length > 200) {
+      return res.status(400).json({ error: 'Invalid actor name' });
+    }
 
     const clusterIds = validateClusterIds(req.query.clusters);
     const categories = validateCategories(req.query.categories);
     const yearRange = validateYearRange(req.query.yearMin, req.query.yearMax);
-    const includeUndated = req.query.includeUndated !== 'false';
+    const includeUndated = req.query.includeUndated !== 'false'; // Default to true
     const keywords = validateKeywords(req.query.keywords);
     const maxHops = validateMaxHops(req.query.maxHops);
+
+    // Build set of selected cluster IDs and categories for filtering
     const selectedClusterIds = new Set<number>(clusterIds);
     const selectedCategories = new Set<string>(categories);
 
-    // Resolve all names (aliases + canonical)
-    const { rows: aliasRows } = await pool.query(`
-      SELECT original_name as name FROM entity_aliases WHERE canonical_name = $1
-      UNION SELECT canonical_name FROM entity_aliases WHERE original_name = $1
-      UNION SELECT $1 as name
-    `, [name]);
-    const allNames = aliasRows.map((r: any) => r.name).filter(Boolean);
+    // Find all aliases for this name (if it's a canonical name)
+    // OR find the canonical name if this is an alias
+    const aliasQuery = db.prepare(`
+      SELECT original_name FROM entity_aliases WHERE canonical_name = ?
+      UNION
+      SELECT canonical_name FROM entity_aliases WHERE original_name = ?
+      UNION
+      SELECT ? as name
+    `).all(name, name, name);
 
-    const { rows: countRows } = await pool.query(`
-      SELECT COUNT(*) as count FROM rdf_triples rt
-      WHERE (rt.actor = ANY($1::text[]) OR rt.target = ANY($1::text[]))
+    const allNames = aliasQuery.map((row: any) => row.original_name || row.canonical_name || row.name);
+    const placeholders = allNames.map(() => '?').join(',');
+
+    // First, get the total count WITHOUT any filters (for the "X of Y" display)
+    const totalRelationships = db.prepare(`
+      SELECT COUNT(*) as count
+      FROM rdf_triples rt
+      WHERE (rt.actor IN (${placeholders}) OR rt.target IN (${placeholders}))
         AND (rt.timestamp IS NULL OR rt.timestamp >= '1970-01-01')
-    `, [allNames]);
-    const totalCount = parseInt(countRows[0].count);
+    `).get(...allNames, ...allNames) as { count: number };
 
-    const params: any[] = [allNames];
-    let whereClauses: string[] = [
-      `(rt.actor = ANY($1::text[]) OR rt.target = ANY($1::text[]))`,
-      `(rt.timestamp IS NULL OR rt.timestamp >= '1970-01-01')`
-    ];
-
+    // Build WHERE clause for categories
+    let categoryWhere = '';
+    let categoryParams: string[] = [];
     if (selectedCategories.size > 0) {
-      params.push(Array.from(selectedCategories));
-      whereClauses.push(`d.category = ANY($${params.length}::text[])`);
+      const catPlaceholders = Array.from(selectedCategories).map(() => '?').join(',');
+      categoryWhere = `AND d.category IN (${catPlaceholders})`;
+      categoryParams = Array.from(selectedCategories);
     }
 
+    // Build WHERE clause for year range
+    let yearWhere = '';
+    let yearParams: string[] = [];
     if (yearRange) {
       const [minYear, maxYear] = yearRange;
       if (includeUndated) {
-        params.push(minYear, maxYear);
-        whereClauses.push(`(rt.timestamp IS NULL OR (LEFT(rt.timestamp,4)::int >= $${params.length-1} AND LEFT(rt.timestamp,4)::int <= $${params.length}))`);
+        yearWhere = `AND (rt.timestamp IS NULL OR (CAST(substr(rt.timestamp, 1, 4) AS INTEGER) >= ? AND CAST(substr(rt.timestamp, 1, 4) AS INTEGER) <= ?))`;
       } else {
-        params.push(minYear, maxYear);
-        whereClauses.push(`(rt.timestamp IS NOT NULL AND LEFT(rt.timestamp,4)::int >= $${params.length-1} AND LEFT(rt.timestamp,4)::int <= $${params.length})`);
+        yearWhere = `AND (rt.timestamp IS NOT NULL AND CAST(substr(rt.timestamp, 1, 4) AS INTEGER) >= ? AND CAST(substr(rt.timestamp, 1, 4) AS INTEGER) <= ?)`;
       }
+      yearParams = [minYear.toString(), maxYear.toString()];
     }
 
+    // Build WHERE clause for hop distance using canonical_entities table
     let hopJoins = '';
+    let hopWhere = '';
+    let hopParams: number[] = [];
     if (maxHops !== null) {
-      params.push(maxHops, maxHops);
       hopJoins = `
-        LEFT JOIN canonical_entities ce_actor ON COALESCE(ea_actor.canonical_name, rt.actor) = ce_actor.canonical_name
-        LEFT JOIN canonical_entities ce_target ON COALESCE(ea_target.canonical_name, rt.target) = ce_target.canonical_name`;
-      whereClauses.push(`ce_actor.hop_distance_from_principal <= $${params.length-1} AND ce_target.hop_distance_from_principal <= $${params.length}`);
+      LEFT JOIN canonical_entities ce_actor ON COALESCE(ea_actor.canonical_name, rt.actor) = ce_actor.canonical_name
+      LEFT JOIN canonical_entities ce_target ON COALESCE(ea_target.canonical_name, rt.target) = ce_target.canonical_name`;
+      hopWhere = `AND ce_actor.hop_distance_from_principal <= ?
+                  AND ce_target.hop_distance_from_principal <= ?`;
+      hopParams = [maxHops, maxHops];
     }
 
-    const sql = `
-      SELECT rt.id, rt.doc_id, rt.timestamp,
+    const allRelationships = db.prepare(`
+      SELECT
+        rt.id,
+        rt.doc_id,
+        rt.timestamp,
         COALESCE(ea_actor.canonical_name, rt.actor) as actor,
         rt.action,
         COALESCE(ea_target.canonical_name, rt.target) as target,
-        rt.location, rt.triple_tags, rt.top_cluster_ids
+        rt.location,
+        rt.triple_tags,
+        rt.top_cluster_ids
       FROM rdf_triples rt
       LEFT JOIN entity_aliases ea_actor ON rt.actor = ea_actor.original_name
       LEFT JOIN entity_aliases ea_target ON rt.target = ea_target.original_name
       ${hopJoins}
       LEFT JOIN documents d ON rt.doc_id = d.doc_id
-      WHERE ${whereClauses.join(' AND ')}
+      WHERE (rt.actor IN (${placeholders}) OR rt.target IN (${placeholders}))
+        AND (rt.timestamp IS NULL OR rt.timestamp >= '1970-01-01')
+        ${categoryWhere}
+        ${yearWhere}
+        ${hopWhere}
       ORDER BY rt.timestamp
-    `;
+    `).all(...allNames, ...allNames, ...categoryParams, ...yearParams, ...hopParams) as Array<{
+      id: number;
+      doc_id: string;
+      timestamp: string | null;
+      actor: string;
+      action: string;
+      target: string;
+      location: string | null;
+      triple_tags: string | null;
+      top_cluster_ids: string | null;
+    }>;
 
-    const { rows: allRelationships } = await pool.query(sql, params);
-
+    // Filter by tag clusters if specified
     let filteredRelationships = allRelationships.filter(rel => {
-      if (selectedClusterIds.size === 0) return true;
+      if (selectedClusterIds.size === 0) return true; // No filter
+
       try {
+        // Use the materialized top_cluster_ids column
         const topClusters = rel.top_cluster_ids ? JSON.parse(rel.top_cluster_ids) : [];
-        return topClusters.some((id: number) => selectedClusterIds.has(id));
-      } catch { return false; }
+        // Include if any of the top 3 clusters are selected
+        return topClusters.some((clusterId: number) => selectedClusterIds.has(clusterId));
+      } catch {
+        return false;
+      }
     });
 
+    // Filter by keywords using BM25 fuzzy matching if specified
     if (keywords.length > 0) {
-      filteredRelationships = filteredRelationships.filter(rel =>
-        calculateBM25Score(`${rel.actor} ${rel.action} ${rel.target} ${rel.location || ''}`, keywords) > 0
-      );
+      filteredRelationships = filteredRelationships.filter(rel => {
+        // Build searchable text from relationship fields
+        const searchText = `${rel.actor} ${rel.action} ${rel.target} ${rel.location || ''}`;
+        const score = calculateBM25Score(searchText, keywords);
+        // Include relationships with non-zero BM25 score (at least one keyword match)
+        return score > 0;
+      });
     }
 
-    const relationships = filteredRelationships.map(({ triple_tags, top_cluster_ids, ...rel }) => ({
-      ...rel, tags: triple_tags ? JSON.parse(triple_tags) : []
+    const relationships = filteredRelationships.map((rel) => ({
+      id: rel.id,
+      doc_id: rel.doc_id,
+      timestamp: rel.timestamp,
+      actor: rel.actor,
+      action: rel.action,
+      target: rel.target,
+      location: rel.location,
+      tags: rel.triple_tags ? JSON.parse(rel.triple_tags) : []
     }));
 
-    res.json({ relationships, totalBeforeFilter: totalCount });
+    res.json({
+      relationships,
+      totalBeforeFilter: totalRelationships.count
+    });
   } catch (error) {
     console.error('Error in /api/actor/:name/relationships:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
-app.get('/api/stats', async (req, res) => {
+// Get statistics with alias resolution
+app.get('/api/stats', (req, res) => {
   try {
-    const [docs, triples, actors, categories] = await Promise.all([
-      pool.query('SELECT COUNT(*) as count FROM documents'),
-      pool.query('SELECT COUNT(*) as count FROM rdf_triples'),
-      pool.query(`SELECT COUNT(DISTINCT COALESCE(ea.canonical_name, rt.actor)) as count
-        FROM rdf_triples rt LEFT JOIN entity_aliases ea ON rt.actor = ea.original_name`),
-      pool.query(`SELECT category, COUNT(*) as count FROM documents GROUP BY category ORDER BY count DESC`)
-    ]);
-    res.json({
-      totalDocuments: { count: parseInt(docs.rows[0].count) },
-      totalTriples: { count: parseInt(triples.rows[0].count) },
-      totalActors: { count: parseInt(actors.rows[0].count) },
-      categories: categories.rows
-    });
+    const stats = {
+      totalDocuments: db.prepare('SELECT COUNT(*) as count FROM documents').get(),
+      totalTriples: db.prepare('SELECT COUNT(*) as count FROM rdf_triples').get(),
+      totalActors: db.prepare(`
+        SELECT COUNT(DISTINCT COALESCE(ea.canonical_name, rt.actor)) as count
+        FROM rdf_triples rt
+        LEFT JOIN entity_aliases ea ON rt.actor = ea.original_name
+      `).get(),
+      categories: db.prepare(`
+        SELECT category, COUNT(*) as count
+        FROM documents
+        GROUP BY category
+        ORDER BY count DESC
+      `).all(),
+    };
+    res.json(stats);
   } catch (error) {
     console.error('Error in /api/stats:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
-app.get('/api/search', async (req, res) => {
+// Search actors with alias resolution
+app.get('/api/search', (req, res) => {
   try {
     const query = req.query.q as string;
-    if (!query) return res.json([]);
-    const { rows } = await pool.query(`
-      SELECT DISTINCT COALESCE(ea.canonical_name, rt.actor) as name, COUNT(*) as connection_count
+    if (!query) {
+      return res.json([]);
+    }
+
+    const results = db.prepare(`
+      SELECT DISTINCT
+        COALESCE(ea.canonical_name, rt.actor) as name,
+        COUNT(*) as connection_count
       FROM rdf_triples rt
       LEFT JOIN entity_aliases ea ON rt.actor = ea.original_name
-      WHERE COALESCE(ea.canonical_name, rt.actor) ILIKE $1
+      WHERE COALESCE(ea.canonical_name, rt.actor) LIKE ?
       GROUP BY COALESCE(ea.canonical_name, rt.actor)
       ORDER BY connection_count DESC
       LIMIT 20
-    `, [`%${query}%`]);
-    res.json(rows);
+    `).all(`%${query}%`);
+
+    res.json(results);
   } catch (error) {
     console.error('Error in /api/search:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
-app.get('/api/actor-counts', async (req, res) => {
+// Get total relationship counts for top N actors (unfiltered totals)
+app.get('/api/actor-counts', (req, res) => {
   try {
-    const { rows } = await pool.query(`
+    const limit = parseInt(req.query.limit as string) || 300;
+
+    // Fetch all relationships WITHOUT filters to get true totals
+    const allRelationships = db.prepare(`
       SELECT
         COALESCE(ea_actor.canonical_name, rt.actor) as actor,
         COALESCE(ea_target.canonical_name, rt.target) as target
@@ -419,16 +636,27 @@ app.get('/api/actor-counts', async (req, res) => {
       LEFT JOIN entity_aliases ea_actor ON rt.actor = ea_actor.original_name
       LEFT JOIN entity_aliases ea_target ON rt.target = ea_target.original_name
       WHERE (rt.timestamp IS NULL OR rt.timestamp >= '1970-01-01')
-    `);
-    const limit = parseInt(req.query.limit as string) || 300;
+    `).all() as Array<{
+      actor: string;
+      target: string;
+    }>;
+
+    // Count relationships per actor
     const actorCounts = new Map<string, number>();
-    rows.forEach(rel => {
+    allRelationships.forEach(rel => {
       actorCounts.set(rel.actor, (actorCounts.get(rel.actor) || 0) + 1);
       actorCounts.set(rel.target, (actorCounts.get(rel.target) || 0) + 1);
     });
+
+    // Get top N actors
     const topActors = Array.from(actorCounts.entries())
-      .sort((a, b) => b[1] - a[1]).slice(0, limit)
-      .reduce((acc, [name, count]) => { acc[name] = count; return acc; }, {} as Record<string, number>);
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .reduce((acc, [name, count]) => {
+        acc[name] = count;
+        return acc;
+      }, {} as Record<string, number>);
+
     res.json(topActors);
   } catch (error) {
     console.error('Error in /api/actor-counts:', error);
@@ -436,71 +664,124 @@ app.get('/api/actor-counts', async (req, res) => {
   }
 });
 
-app.get('/api/actor/:name/count', async (req, res) => {
+// Get total relationship count for a specific actor (unfiltered total)
+app.get('/api/actor/:name/count', (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT COUNT(*) as count FROM rdf_triples rt
+    const name = req.params.name;
+
+    // Count total relationships for this actor WITHOUT filters
+    const result = db.prepare(`
+      SELECT COUNT(*) as count
+      FROM rdf_triples rt
       LEFT JOIN entity_aliases ea_actor ON rt.actor = ea_actor.original_name
       LEFT JOIN entity_aliases ea_target ON rt.target = ea_target.original_name
-      WHERE (COALESCE(ea_actor.canonical_name, rt.actor) = $1 OR COALESCE(ea_target.canonical_name, rt.target) = $1)
-        AND (rt.timestamp IS NULL OR rt.timestamp >= '1970-01-01')
-    `, [req.params.name]);
-    res.json({ count: parseInt(rows[0].count) });
+      WHERE (COALESCE(ea_actor.canonical_name, rt.actor) = ? OR COALESCE(ea_target.canonical_name, rt.target) = ?)
+      AND (rt.timestamp IS NULL OR rt.timestamp >= '1970-01-01')
+    `).get(name, name) as { count: number };
+
+    res.json({ count: result.count });
   } catch (error) {
     console.error('Error in /api/actor/:name/count:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
-app.get('/api/document/:docId', async (req, res) => {
+// Get document by doc_id
+app.get('/api/document/:docId', (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT doc_id, file_path, one_sentence_summary, paragraph_summary,
-        category, date_range_earliest, date_range_latest
-      FROM documents WHERE doc_id = $1
-    `, [req.params.docId]);
-    if (!rows[0]) return res.status(404).json({ error: 'Document not found' });
-    res.json(rows[0]);
+    const { docId } = req.params;
+    const doc = db.prepare(`
+      SELECT
+        doc_id,
+        file_path,
+        one_sentence_summary,
+        paragraph_summary,
+        category,
+        date_range_earliest,
+        date_range_latest
+      FROM documents
+      WHERE doc_id = ?
+    `).get(docId);
+
+    if (!doc) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    res.json(doc);
   } catch (error) {
     console.error('Error in /api/document/:docId:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
-app.get('/api/document/:docId/text', async (req, res) => {
+// Get document text from database
+app.get('/api/document/:docId/text', (req, res) => {
   try {
     const { docId } = req.params;
-    if (!docId || docId.length > 100 || /[<>:"|?*]/.test(docId)) return res.status(400).json({ error: 'Invalid document ID' });
-    const { rows } = await pool.query('SELECT full_text FROM documents WHERE doc_id = $1', [docId]);
-    if (!rows[0]) return res.status(404).json({ error: 'Document not found' });
-    if (!rows[0].full_text) return res.status(404).json({ error: 'Document text not available' });
-    res.json({ text: rows[0].full_text });
+
+    // Validate docId
+    if (!docId || docId.length > 100 || /[<>:"|?*]/.test(docId)) {
+      return res.status(400).json({ error: 'Invalid document ID' });
+    }
+
+    const doc = db.prepare('SELECT full_text FROM documents WHERE doc_id = ?').get(docId) as { full_text: string | null } | undefined;
+
+    if (!doc) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    if (!doc.full_text) {
+      return res.status(404).json({ error: 'Document text not available' });
+    }
+
+    res.json({ text: doc.full_text });
   } catch (error) {
     console.error('Error in /api/document/:docId/text:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
+// Get tag clusters
 app.get('/api/tag-clusters', (req, res) => {
   try {
-    res.json(tagClusters.map((c: any) => ({ id: c.id, name: c.name, exemplars: c.exemplars, tagCount: c.tags.length })));
+    // Return just the cluster metadata (id, name, exemplars) without all tags
+    const clusters = tagClusters.map((cluster: any) => ({
+      id: cluster.id,
+      name: cluster.name,
+      exemplars: cluster.exemplars,
+      tagCount: cluster.tags.length
+    }));
+    res.json(clusters);
   } catch (error) {
+    console.error('Error in /api/tag-clusters:', error);
     res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
+// Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
 });
 
-// Serve frontend
+// Serve static frontend files
 const frontendPath = path.join(process.cwd(), 'network-ui', 'dist');
 if (fs.existsSync(frontendPath)) {
   app.use(express.static(frontendPath));
+
+  // Serve index.html for all non-API routes (SPA support)
   app.use((req, res, next) => {
-    if (req.path.startsWith('/api') || req.path.startsWith('/health')) return next();
+    // Skip API routes
+    if (req.path.startsWith('/api') || req.path.startsWith('/health')) {
+      return next();
+    }
+    // Serve index.html for all other routes (client-side routing)
     res.sendFile(path.join(frontendPath, 'index.html'));
   });
+
   console.log(`✓ Serving frontend from ${frontendPath}`);
 } else {
   console.log(`⚠ Frontend build not found at ${frontendPath}`);
@@ -511,5 +792,26 @@ const server = app.listen(PORT, () => {
   console.log(`📊 Network UI will connect to this server\n`);
 });
 
-process.on('SIGTERM', () => server.close(() => { pool.end(); console.log('Server closed'); }));
-process.on('SIGINT', () => server.close(() => { pool.end(); console.log('Server closed'); }));
+// Graceful shutdown
+const gracefulShutdown = (signal: string) => {
+  console.log(`\n${signal} received, closing server gracefully...`);
+  server.close(() => {
+    console.log('HTTP server closed');
+    try {
+      db.close();
+      console.log('Database connection closed');
+    } catch (error) {
+      console.error('Error closing database:', error);
+    }
+    process.exit(0);
+  });
+
+  // Force shutdown after 10 seconds
+  setTimeout(() => {
+    console.error('Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
